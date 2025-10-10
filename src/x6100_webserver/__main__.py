@@ -18,6 +18,9 @@ def run():
     plugin = bottle.ext.sqlite.Plugin(dbfile=args.db, keyword="dbcon")
     apps.app.install(plugin)
     settings.FILEBROWSER_PATH = args.filebrowser_path
+    settings.DB_PATH = args.db
+    apps.sync_poll_task()
     apps.app.run(host=args.host, port=args.port, debug=args.debug, reloader=args.debug)
 
 run()
+4

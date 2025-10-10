@@ -1,2 +1,3 @@
 
 FILEBROWSER_PATH = ""
+DB_PATH = ""

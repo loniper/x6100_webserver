@@ -4,6 +4,10 @@ import json
 import os
 import pathlib
 import subprocess
+import sqlite3
+
+import urllib.request
+import threading
 
 import bottle
 
@@ -126,7 +130,6 @@ def bands():
 @app.route('/digital_modes')
 def digital_modes():
     return bottle.template('digital_modes')
-
 
 @app.route('/files/')
 @app.route('/files/<filepath:path>')
@@ -254,3 +257,169 @@ def set_timezone():
     except subprocess.CalledProcessError as e:
         bottle.response.status = 500
         return {"status": "error", "msg": f"Failed to set timezone: {str(e)}"}
+
+
+# Wavelog Sync routes
+
+X6100_MODE_MAP = ['SSB', 'SSB', 'SSB', 'SSB', 'CW', 'CW', 'AM', 'FM']
+X6100_LAST_VFO = {}
+
+X6100_SYNC_DELAY = 0
+X6100_SYNC_TIMER = None
+
+def sync_poll_task():
+    with sqlite3.connect(settings.DB_PATH, check_same_thread=False) as conn:
+        do_sync(conn)
+
+@app.route('/sync')
+def sync():
+    return bottle.template('sync')
+
+@app.post('/api/do_sync')
+def do_sync(dbcon):
+    "Sync RIG infomation to Wavelog."
+
+    data = None
+    try:
+        data = bottle.request.json
+    except:
+        pass
+
+    if not data:
+        data = {}
+        row = dbcon.execute(
+            "SELECT val FROM params WHERE name = ?", ("sync_key",)).fetchone()
+        if not row:
+            return
+        data['key'] = row[0]
+
+        row = dbcon.execute(
+            "SELECT val FROM params WHERE name = ?", ("sync_endpoint",)).fetchone()
+        if not row:
+            return
+        data['endpoint'] = row[0]
+
+        row = dbcon.execute(
+            "SELECT val FROM params WHERE name = ?", ("sync_delay",)).fetchone()
+        if not row:
+            return
+        data['delay'] = row[0]
+
+    if int(data.get('delay')) <= 0:
+        return
+
+    payload = {
+        "key": data["key"],
+        "radio": "Xiegu X6100",
+    }
+
+    payload['power'] = int(dbcon.execute(
+        "SELECT val FROM params WHERE name = ?", ("pwr",)).fetchone()[0])/10
+
+    # Read the band first and lookup band params
+    band = dbcon.execute(
+        "SELECT val FROM params WHERE name = ?", ("band",)).fetchone()[0]
+    payload['frequency']= dbcon.execute(
+        "SELECT val FROM band_params WHERE bands_id = ? AND name = ?",
+        (band, "vfoa_freq",)).fetchone()[0]
+    payload['mode']= X6100_MODE_MAP[int(dbcon.execute(
+        "SELECT val FROM band_params WHERE bands_id = ? AND name = ?",
+        (band, "vfoa_mode",)).fetchone()[0])]
+
+    # Don't fire the poll task if in testing
+    global X6100_SYNC_TIMER
+    if not data.get('nodelay'):
+        X6100_SYNC_DELAY = int(data['delay'])
+        if X6100_SYNC_DELAY > 0:
+            X6100_SYNC_TIMER = threading.Timer(X6100_SYNC_DELAY, sync_poll_task)
+            X6100_SYNC_TIMER.start()
+
+    # Deduplicate if nodelay wasn't asked
+    global X6100_LAST_VFO
+
+    if not data.get('nodelay'):
+        if payload['mode'] == X6100_LAST_VFO.get('mode') and payload['frequency'] == X6100_LAST_VFO.get('frequency') and payload['power'] == X6100_LAST_VFO.get('power'):
+            return
+
+    X6100_LAST_VFO = payload
+    json_payload = json.dumps(payload).encode('utf-8')
+
+    req = urllib.request.Request(
+        data['endpoint'],
+        data=json_payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        },
+        method="POST"
+    )
+
+    timestamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+    cur = dbcon.cursor()
+    cur.execute("SELECT val FROM params WHERE name = ?", ("sync_timestamp",))
+    if cur.fetchone():
+        cur.execute("UPDATE params SET val = ? WHERE name = ?",
+                    (timestamp, "sync_timestamp"))
+    else:
+        cur.execute("INSERT INTO params (name, val) VALUES (?, ?)",
+                    ("sync_timestamp", timestamp))
+        dbcon.commit()
+
+    try:
+        with urllib.request.urlopen(req, timeout = 10) as resp:
+            return resp.read() if resp.status == 200 else resp.status
+    except urllib.error.HTTPError as e:
+        return f"HTTP Error {e.code}: {e.reason}"
+    except urllib.error.URLError as e:
+        return f"URL Error: {e.reason}"
+
+@app.post('/api/save_sync')
+def save_sync(dbcon):
+    data = bottle.request.json
+    if not data:
+        return {"error": "No JSON received"}
+
+    mapping = {
+        "key": "sync_key",
+        "endpoint": "sync_endpoint",
+        "delay": "sync_delay"
+    }
+
+    for field, name in mapping.items():
+        val = str(data.get(field, ''))
+        cur = dbcon.cursor()
+        cur.execute("SELECT val FROM params WHERE name = ?", (name,))
+        if cur.fetchone():
+            cur.execute("UPDATE params SET val = ? WHERE name = ?", (val, name))
+        else:
+            cur.execute("INSERT INTO params (name, val) VALUES (?, ?)", (name, val))
+        dbcon.commit()
+
+    global X6100_SYNC_TIMER
+    if X6100_SYNC_TIMER.is_alive():
+        return {"status": "ok"}
+
+    X6100_SYNC_DELAY = int(data['delay'])
+    if X6100_SYNC_DELAY > 0:
+        X6100_SYNC_TIMER = threading.Timer(X6100_SYNC_DELAY, sync_poll_task)
+        X6100_SYNC_TIMER.start()
+
+    return {"status": "ok"}
+
+@app.get('/api/get_sync')
+def get_sync(dbcon):
+    mapping = {
+        "key": "sync_key",
+        "endpoint": "sync_endpoint",
+        "delay": "sync_delay",
+        "timestamp": "sync_timestamp",
+    }
+
+    result = {}
+    cur = dbcon.cursor()
+    for field, name in mapping.items():
+        row = cur.execute("SELECT val FROM params WHERE name = ?", (name,)).fetchone()
+        if row:
+            result[field] = row[0]
+
+    return result
