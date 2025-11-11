@@ -261,118 +261,134 @@ def set_timezone():
 
 # Wavelog Sync routes
 
-X6100_MODE_MAP = ['SSB', 'SSB', 'SSB', 'SSB', 'CW', 'CW', 'AM', 'FM']
-X6100_LAST_VFO = {}
+import bottle
+import sqlite3
+import threading
+import urllib.request, urllib.error
+import json
+from datetime import datetime
+import settings
+import os
 
 X6100_SYNC_DELAY = 0
 X6100_SYNC_TIMER = None
 
+ADI_LOG_PATH = "/log/ft_log.adi"
+
+
+# ---------- 定时任务 ----------
 def sync_poll_task():
+    """周期性任务：读取 ADIF 日志并上传到 Wavelog"""
     with sqlite3.connect(settings.DB_PATH, check_same_thread=False) as conn:
         do_sync(conn)
 
+
+# ---------- 页面 ----------
 @app.route('/sync')
 def sync():
     return bottle.template('sync')
 
+
+# ---------- 上传逻辑 ----------
 @app.post('/api/do_sync')
 def do_sync(dbcon):
-    "Sync RIG infomation to Wavelog."
-
-    data = None
+    """上传通联日志至 Wavelog（仅上传新增部分）"""
     try:
-        data = bottle.request.json
+        data = bottle.request.json or {}
     except:
-        pass
-
-    if not data:
         data = {}
-        row = dbcon.execute(
-            "SELECT val FROM params WHERE name = ?", ("sync_key",)).fetchone()
-        if not row:
-            return
-        data['key'] = row[0]
 
-        row = dbcon.execute(
-            "SELECT val FROM params WHERE name = ?", ("sync_endpoint",)).fetchone()
-        if not row:
-            return
-        data['endpoint'] = row[0]
+    # 从数据库读取配置
+    if not data.get("key"):
+        cur = dbcon.cursor()
+        mapping = {
+            "key": "sync_key",
+            "endpoint": "sync_endpoint",
+            "delay": "sync_delay",
+            "station_profile_id": "sync_station_profile_id"
+        }
+        for field, name in mapping.items():
+            row = cur.execute("SELECT val FROM params WHERE name = ?", (name,)).fetchone()
+            if row:
+                data[field] = row[0]
 
-        row = dbcon.execute(
-            "SELECT val FROM params WHERE name = ?", ("sync_delay",)).fetchone()
-        if not row:
-            return
-        data['delay'] = row[0]
+    if int(data.get('delay', 0)) <= 0 and not data.get('nodelay'):
+        return "Auto sync disabled (delay=0)."
 
-    if int(data.get('delay')) <= 0:
-        return
+    # 日志文件检查
+    if not os.path.exists(ADI_LOG_PATH):
+        return f"Log file not found: {ADI_LOG_PATH}"
+
+    # 获取上次同步偏移量
+    cur = dbcon.cursor()
+    row = cur.execute("SELECT val FROM params WHERE name = ?", ("sync_log_offset",)).fetchone()
+    last_offset = int(row[0]) if row else 0
+
+    # 打开文件并读取新内容
+    filesize = os.path.getsize(ADI_LOG_PATH)
+    if filesize <= last_offset:
+        return "No new QSO records to upload."
+
+    with open(ADI_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        f.seek(last_offset)
+        new_data = f.read().strip()
+
+    if not new_data:
+        return "No new QSO data found."
 
     payload = {
         "key": data["key"],
-        "radio": "Xiegu X6100",
+        "station_profile_id": data["station_profile_id"],
+        "type": "adif",
+        "string": new_data
     }
 
-    payload['power'] = int(dbcon.execute(
-        "SELECT val FROM params WHERE name = ?", ("pwr",)).fetchone()[0])/10
-
-    # Read the band first and lookup band params
-    band = dbcon.execute(
-        "SELECT val FROM params WHERE name = ?", ("band",)).fetchone()[0]
-    payload['frequency']= dbcon.execute(
-        "SELECT val FROM band_params WHERE bands_id = ? AND name = ?",
-        (band, "vfoa_freq",)).fetchone()[0]
-    payload['mode']= X6100_MODE_MAP[int(dbcon.execute(
-        "SELECT val FROM band_params WHERE bands_id = ? AND name = ?",
-        (band, "vfoa_mode",)).fetchone()[0])]
-
-    # Don't fire the poll task if in testing
-    global X6100_SYNC_TIMER
+    # 启动定时任务（除测试模式外）
+    global X6100_SYNC_DELAY, X6100_SYNC_TIMER
     if not data.get('nodelay'):
         X6100_SYNC_DELAY = int(data['delay'])
         if X6100_SYNC_DELAY > 0:
             X6100_SYNC_TIMER = threading.Timer(X6100_SYNC_DELAY, sync_poll_task)
             X6100_SYNC_TIMER.start()
 
-    # Deduplicate if nodelay wasn't asked
-    global X6100_LAST_VFO
-
-    if not data.get('nodelay'):
-        if payload['mode'] == X6100_LAST_VFO.get('mode') and payload['frequency'] == X6100_LAST_VFO.get('frequency') and payload['power'] == X6100_LAST_VFO.get('power'):
-            return
-
-    X6100_LAST_VFO = payload
-    json_payload = json.dumps(payload).encode('utf-8')
-
+    # 准备 HTTP 请求
     req = urllib.request.Request(
         data['endpoint'],
-        data=json_payload,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        },
+        data=json.dumps(payload).encode('utf-8'),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST"
     )
 
-    timestamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-    cur = dbcon.cursor()
-    cur.execute("SELECT val FROM params WHERE name = ?", ("sync_timestamp",))
-    if cur.fetchone():
-        cur.execute("UPDATE params SET val = ? WHERE name = ?",
-                    (timestamp, "sync_timestamp"))
-    else:
-        cur.execute("INSERT INTO params (name, val) VALUES (?, ?)",
-                    ("sync_timestamp", timestamp))
-        dbcon.commit()
-
     try:
-        with urllib.request.urlopen(req, timeout = 10) as resp:
-            return resp.read() if resp.status == 200 else resp.status
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status == 200:
+                # 上传成功后记录新的偏移量和时间戳
+                timestamp = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+                new_offset = filesize
+
+                cur.execute("SELECT val FROM params WHERE name = ?", ("sync_timestamp",))
+                if cur.fetchone():
+                    cur.execute("UPDATE params SET val = ? WHERE name = ?", (timestamp, "sync_timestamp"))
+                else:
+                    cur.execute("INSERT INTO params (name, val) VALUES (?, ?)", ("sync_timestamp", timestamp))
+
+                cur.execute("SELECT val FROM params WHERE name = ?", ("sync_log_offset",))
+                if cur.fetchone():
+                    cur.execute("UPDATE params SET val = ? WHERE name = ?", (new_offset, "sync_log_offset"))
+                else:
+                    cur.execute("INSERT INTO params (name, val) VALUES (?, ?)", ("sync_log_offset", new_offset))
+                dbcon.commit()
+
+                return f"Upload successful ({filesize - last_offset} bytes)."
+            else:
+                return f"HTTP {resp.status}"
     except urllib.error.HTTPError as e:
         return f"HTTP Error {e.code}: {e.reason}"
     except urllib.error.URLError as e:
         return f"URL Error: {e.reason}"
 
+
+# ---------- 保存配置 ----------
 @app.post('/api/save_sync')
 def save_sync(dbcon):
     data = bottle.request.json
@@ -382,23 +398,24 @@ def save_sync(dbcon):
     mapping = {
         "key": "sync_key",
         "endpoint": "sync_endpoint",
-        "delay": "sync_delay"
+        "delay": "sync_delay",
+        "station_profile_id": "sync_station_profile_id"
     }
 
+    cur = dbcon.cursor()
     for field, name in mapping.items():
         val = str(data.get(field, ''))
-        cur = dbcon.cursor()
-        cur.execute("SELECT val FROM params WHERE name = ?", (name,))
-        if cur.fetchone():
+        row = cur.execute("SELECT val FROM params WHERE name = ?", (name,)).fetchone()
+        if row:
             cur.execute("UPDATE params SET val = ? WHERE name = ?", (val, name))
         else:
             cur.execute("INSERT INTO params (name, val) VALUES (?, ?)", (name, val))
-        dbcon.commit()
+    dbcon.commit()
 
-    global X6100_SYNC_TIMER
-    if X6100_SYNC_TIMER.is_alive():
-        return {"status": "ok"}
-
+    # 重启定时任务
+    global X6100_SYNC_DELAY, X6100_SYNC_TIMER
+    if X6100_SYNC_TIMER and X6100_SYNC_TIMER.is_alive():
+        X6100_SYNC_TIMER.cancel()
     X6100_SYNC_DELAY = int(data['delay'])
     if X6100_SYNC_DELAY > 0:
         X6100_SYNC_TIMER = threading.Timer(X6100_SYNC_DELAY, sync_poll_task)
@@ -406,6 +423,8 @@ def save_sync(dbcon):
 
     return {"status": "ok"}
 
+
+# ---------- 获取配置 ----------
 @app.get('/api/get_sync')
 def get_sync(dbcon):
     mapping = {
@@ -413,6 +432,8 @@ def get_sync(dbcon):
         "endpoint": "sync_endpoint",
         "delay": "sync_delay",
         "timestamp": "sync_timestamp",
+        "station_profile_id": "sync_station_profile_id",
+        "log_offset": "sync_log_offset"
     }
 
     result = {}
