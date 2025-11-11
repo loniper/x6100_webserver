@@ -273,7 +273,7 @@ import os
 X6100_SYNC_DELAY = 0
 X6100_SYNC_TIMER = None
 
-ADI_LOG_PATH = "/log/ft_log.adi"
+ADI_LOG_PATH = "/mnt/ft_log.adi"
 
 
 # ---------- 定时任务 ----------
