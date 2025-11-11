@@ -1,103 +1,76 @@
-% rebase('base.html', title='Wavelog Sync Configuration')
+% rebase('base.html', title='Wavelog Log Upload Configuration')
 
 <h3>Wavelog Sync Configuration</h3>
 
 <p id="last-sync" style="display: none;">Last sync: Unknown</p>
 
-<p>Sync delay (in second, sync after a delay in case of QSY, leave it to 0 to disable sync): </p>
-<input id="sync-delay" type="number" placeholder="1000">
+<p>定时同步时间（单位：秒，设置为0则关闭自动同步）:</p>
+<input id="sync-delay" type="number" placeholder="3600">
 
-<p>Wavelog endpoint:</p>
-<input id="sync-endpoint" type="text" placeholder="https://example.org/index.php/api/radio">
+<p>Wavelog QSO 上传接口:</p>
+<input id="sync-endpoint" type="text" placeholder="https://example.org/index.php/api/qso">
 
 <p>Wavelog API key:</p>
 <input id="sync-key" type="text" placeholder="cl123456789abcd">
 
+<p>Station Profile ID:</p>
+<input id="station-profile-id" type="text" placeholder="1">
+
 <br />
 
-<button id="test-button">Test Sync</button>
-<button id="save-button">Save Sync</button>
+<button id="test-button">Test Upload</button>
+<button id="save-button">Save Configuration</button>
 
 <script>
+window.addEventListener('DOMContentLoaded', () => {
+    fetch('/api/get_sync')
+        .then(r => r.json())
+        .then(data => {
+            if (data.delay) document.getElementById('sync-delay').value = data.delay;
+            if (data.endpoint) document.getElementById('sync-endpoint').value = data.endpoint;
+            if (data.key) document.getElementById('sync-key').value = data.key;
+            if (data.station_profile_id) document.getElementById('station-profile-id').value = data.station_profile_id;
 
-  window.addEventListener('DOMContentLoaded', () => {
-      fetch('/api/get_sync')
-          .then(response => {
-              if (!response.ok) throw new Error('Network response was not ok');
-              return response.json();
-          })
-          .then(data => {
-              if (data.delay !== undefined)
-		  document.getElementById('sync-delay').value = data.delay;
-              if (data.endpoint !== undefined)
-		  document.getElementById('sync-endpoint').value = data.endpoint;
-              if (data.key !== undefined)
-		  document.getElementById('sync-key').value = data.key;
+            if (data.timestamp) {
+                const lastSync = document.getElementById('last-sync');
+                lastSync.textContent = 'Last sync: ' + data.timestamp;
+                lastSync.style.display = 'block';
+            }
+        });
+});
 
-	      if (data.timestamp) {
-                  const lastSync = document.getElementById('last-sync');
-                  lastSync.textContent = 'Last sync: ' + data.timestamp;
-                  lastSync.style.display = 'block';
-              }
-          })
-          .catch(error => {
-              console.error('Error fetching sync config:', error);
-          });
-  });
+document.getElementById('test-button').addEventListener('click', () => {
+    const data = {
+        delay: document.getElementById('sync-delay').value,
+        endpoint: document.getElementById('sync-endpoint').value,
+        key: document.getElementById('sync-key').value,
+        station_profile_id: document.getElementById('station-profile-id').value,
+        nodelay: true
+    };
+    fetch('/api/do_sync', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+    })
+    .then(r => r.text())
+    .then(body => alert('Response:\n' + body))
+    .catch(err => alert('Error: ' + err));
+});
 
-  document.getElementById('test-button').addEventListener('click', function() {
-      const delay = document.getElementById('sync-delay').value;
-      const endpoint = document.getElementById('sync-endpoint').value;
-      const apiKey = document.getElementById('sync-key').value;
-
-      const data = {
-          delay: delay,
-          endpoint: endpoint,
-          key: apiKey,
-	  nodelay: true
-      };
-
-      fetch('/api/do_sync', {
-          method: 'POST',
-          headers: {
-              'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(data)
-      }).then(response => {
-	  if (!response.ok) throw new Error('Network response was not ok');
-	  return response.text();
-      }).then(body => {
-	  alert('Response:\n' + body);
-      }).catch(error => {
-	  alert('Error: ' + error);
-      });
-  });
-
-  document.getElementById('save-button').addEventListener('click', function() {
-      const delay = document.getElementById('sync-delay').value;
-      const endpoint = document.getElementById('sync-endpoint').value;
-      const apiKey = document.getElementById('sync-key').value;
-
-      const data = {
-          delay: delay,
-          endpoint: endpoint,
-          key: apiKey,
-      };
-
-      fetch('/api/save_sync', {
-          method: 'POST',
-          headers: {
-              'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(data)
-      }).then(response => {
-	  if (!response.ok) throw new Error('Network response was not ok');
-	  return response.text();
-      }).then(body => {
-	  alert('Response:\n' + body);
-      }).catch(error => {
-	  alert('Error: ' + error);
-      });
-  });
-
+document.getElementById('save-button').addEventListener('click', () => {
+    const data = {
+        delay: document.getElementById('sync-delay').value,
+        endpoint: document.getElementById('sync-endpoint').value,
+        key: document.getElementById('sync-key').value,
+        station_profile_id: document.getElementById('station-profile-id').value
+    };
+    fetch('/api/save_sync', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+    })
+    .then(r => r.text())
+    .then(body => alert('Response:\n' + body))
+    .catch(err => alert('Error: ' + err));
+});
 </script>
